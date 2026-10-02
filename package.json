@@ -1,0 +1,20 @@
+{
+  "name": "arabic-budget-lessons-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Arabic budget and tutoring tracker with Supabase auth, cloud persistence, and Vercel serverless admin access.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "check": "node --check app.js && node --check api/config.js && node --check api/admin-data.js && node --check api/notify.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "vercel": "^41.7.0"
+  }
+}
