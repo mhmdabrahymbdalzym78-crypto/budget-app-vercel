@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f172a">
+  <title>لوحة المتحكم — محفظتي</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <style>body{font-family:Tahoma,Arial,sans-serif}.ltr{direction:ltr;text-align:left}</style>
+</head>
+<body class="min-h-screen bg-slate-100 text-slate-800">
+  <header class="bg-slate-900 text-white shadow-lg">
+    <div class="max-w-6xl mx-auto px-4 py-4 flex flex-wrap items-center justify-between gap-3">
+      <div><p class="text-xs text-emerald-300">مساحة آمنة للمتحكم</p><h1 class="text-xl font-black mt-1">لوحة تحكم المستخدمين</h1></div>
+      <div class="flex gap-2">
+        <a href="/" class="rounded-lg bg-white/10 hover:bg-white/20 px-3 py-2 text-sm"><i class="fa-solid fa-arrow-right ml-1"></i>العودة للتطبيق</a>
+        <button id="signOutButton" class="rounded-lg bg-rose-600 hover:bg-rose-700 px-3 py-2 text-sm"><i class="fa-solid fa-right-from-bracket ml-1"></i>تسجيل الخروج</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6 space-y-5">
+    <section class="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+      <strong>تنبيه خصوصية:</strong> هذه الصفحة تعرض البيانات التي أدخلها المستخدمون. يسجل الخادم طلبات عرض السجلات في سجل التدقيق، ولا تُحمّل البيانات إلا بعد التحقق من جلسة الدخول ودور المتحكم.
+    </section>
+
+    <section class="grid gap-3 sm:grid-cols-3">
+      <article class="rounded-2xl bg-white p-4 shadow-sm border border-slate-200"><p class="text-xs text-slate-500">حالة التحقق</p><p id="statusText" role="status" class="font-bold mt-2">جارٍ التحقق من صلاحية الحساب…</p></article>
+      <article class="rounded-2xl bg-white p-4 shadow-sm border border-slate-200"><p class="text-xs text-slate-500">عدد الحسابات</p><p id="userCount" class="text-2xl font-black mt-1">—</p></article>
+      <article class="rounded-2xl bg-white p-4 shadow-sm border border-slate-200"><p class="text-xs text-slate-500">آخر تحديث للقائمة</p><p id="updatedAt" class="text-sm font-bold mt-2">—</p></article>
+    </section>
+
+    <section class="rounded-2xl bg-white p-4 sm:p-5 shadow-sm border border-slate-200">
+      <div class="flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between mb-4">
+        <div><h2 class="font-black">سجلات المستخدمين</h2><p class="text-xs text-slate-500 mt-1">افتح سجلًا لرؤية البيانات المحفوظة لذلك الحساب.</p></div>
+        <div class="flex gap-2">
+          <input id="searchInput" type="search" placeholder="ابحث بالبريد أو المعرّف" class="w-full sm:w-64 border border-slate-300 rounded-xl px-3 py-2 text-sm">
+          <button id="refreshButton" class="shrink-0 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 text-sm"><i class="fa-solid fa-rotate ml-1"></i>تحديث</button>
+        </div>
+      </div>
+      <p id="errorMessage" class="hidden rounded-xl bg-rose-50 border border-rose-200 p-3 text-sm text-rose-800 mb-3"></p>
+      <div id="usersList" class="space-y-3"><p class="text-sm text-slate-500">جارٍ تحميل البيانات…</p></div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="/api/config"></script>
+  <script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  let client;
+  let records = [];
+
+  const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const readableDate = (value) => {
+    if (!value) return 'لا توجد بيانات بعد';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? 'غير متاح' : date.toLocaleString('ar-EG');
+  };
+  function showError(message) {
+    $('errorMessage').textContent = message;
+    $('errorMessage').classList.remove('hidden');
+    $('usersList').innerHTML = '';
+  }
+  function render() {
+    const query = $('searchInput').value.trim().toLocaleLowerCase('ar');
+    const filtered = records.filter((record) => `${record.email || ''} ${record.user_id || ''}`.toLocaleLowerCase('ar').includes(query));
+    $('userCount').textContent = String(records.length);
+    $('updatedAt').textContent = new Date().toLocaleString('ar-EG');
+    if (!filtered.length) {
+      $('usersList').innerHTML = `<p class="rounded-xl bg-slate-50 p-4 text-sm text-slate-500">${records.length ? 'لا توجد نتائج مطابقة للبحث.' : 'لا توجد حسابات مسجلة.'}</p>`;
+      return;
+    }
+    $('usersList').innerHTML = filtered.map((record, index) => {
+      const json = JSON.stringify(record.state || {}, null, 2);
+      return `<article class="rounded-xl border border-slate-200 p-4 hover:border-indigo-200">
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div class="min-w-0"><h3 class="font-bold break-all">${escapeHtml(record.email || 'بريد غير متاح')}</h3><p class="ltr text-[11px] text-slate-500 break-all mt-1">${escapeHtml(record.user_id)}</p></div>
+          <span class="shrink-0 rounded-full bg-slate-100 px-3 py-1 text-[11px] text-slate-600">حساب ${index + 1}</span>
+        </div>
+        <div class="grid gap-2 sm:grid-cols-2 mt-3 text-xs text-slate-600"><p>تاريخ الإنشاء: <strong>${escapeHtml(readableDate(record.created_at))}</strong></p><p>آخر حفظ: <strong>${escapeHtml(readableDate(record.updated_at))}</strong></p></div>
+        <details class="mt-3"><summary class="cursor-pointer rounded-lg bg-indigo-50 px-3 py-2 text-sm font-bold text-indigo-800">عرض بيانات التطبيق</summary><pre class="ltr mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950 p-4 text-xs text-emerald-100">${escapeHtml(json)}</pre></details>
+      </article>`;
+    }).join('');
+  }
+
+  async function loadUsers() {
+    $('errorMessage').classList.add('hidden');
+    $('statusText').textContent = 'جارٍ التحقق من الصلاحية…';
+    $('usersList').innerHTML = '<p class="text-sm text-slate-500">جارٍ التحميل…</p>';
+    try {
+      if (!window.APP_CONFIG?.supabaseUrl || !window.APP_CONFIG?.supabaseAnonKey || !window.supabase?.createClient) throw new Error('إعدادات التطبيق غير مكتملة. راجع مفاتيح Supabase في Vercel.');
+      if (!client) client = window.supabase.createClient(window.APP_CONFIG.supabaseUrl, window.APP_CONFIG.supabaseAnonKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
+      const { data: { session } } = await client.auth.getSession();
+      if (!session?.access_token) {
+        $('statusText').textContent = 'يلزم تسجيل الدخول';
+        showError('سجّل الدخول أولًا من الصفحة الرئيسية، ثم افتح لوحة المتحكم مجددًا.');
+        return;
+      }
+      const headers = { Authorization: `Bearer ${session.access_token}` };
+      const statusResponse = await fetch('/api/admin-data?mode=status', { headers, cache: 'no-store' });
+      const statusPayload = await statusResponse.json();
+      if (!statusResponse.ok) throw new Error(statusPayload.error || 'تعذر التحقق. راجع إعدادات الخادم في Vercel.');
+      if (!statusPayload.isAdmin) {
+        $('statusText').textContent = 'هذا الحساب ليس متحكمًا';
+        showError('صلاحية المتحكم غير مفعّلة لهذا البريد. بعد تأكيد الحساب، شغّل ملف supabase/promote-admin.sql في Supabase SQL Editor، ثم سجّل الخروج والدخول مجددًا.');
+        return;
+      }
+      $('statusText').textContent = 'تم التحقق — متحكم';
+      const response = await fetch('/api/admin-data', { headers, cache: 'no-store' });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || 'تعذر تحميل السجلات.');
+      records = Array.isArray(payload.users) ? payload.users : [];
+      render();
+    } catch (error) {
+      $('statusText').textContent = 'تعذر تحميل لوحة التحكم';
+      showError(error.message || 'حدث خطأ غير متوقع. تحقق من إعدادات Supabase وVercel ثم أعد المحاولة.');
+    }
+  }
+
+  $('searchInput').addEventListener('input', render);
+  $('refreshButton').addEventListener('click', loadUsers);
+  $('signOutButton').addEventListener('click', async () => {
+    if (client) await client.auth.signOut();
+    window.location.assign('/');
+  });
+  loadUsers();
+})();
+
+  </script>
+</body>
+</html>
