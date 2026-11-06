@@ -1,381 +1,857 @@
-/* Budget app: Arabic UI retained from the supplied HTML; cloud persistence through Supabase. */
+
+/*
+ * Budget App - hardened Supabase client-side controller
+ * ----------------------------------------------------
+ * Requires:
+ * 1) Supabase JS v2 loaded as window.supabase
+ * 2) window.APP_CONFIG.supabaseUrl and window.APP_CONFIG.supabaseAnonKey
+ * OR window.SUPABASE_URL and window.SUPABASE_ANON_KEY
+ * 3) public.app_data(user_id PRIMARY KEY, state JSONB, updated_at TIMESTAMPTZ)
+ * 4) RLS policies restricting every row to auth.uid() = user_id
+ *
+ * This file manages authentication, state loading, validation, dashboard totals,
+ * debounced saving, serialized cloud writes, and a safe public state API.
+ * It does not create the app's HTML forms or visual expense-management screens.
+ */
 (() => {
   'use strict';
+
   const $ = (id) => document.getElementById(id);
-  const CATEGORIES = ['مواصلات', 'أكل', 'مستلزمات', 'دروس', 'أخرى'];
+  const CATEGORIES = Object.freeze(['مواصلات', 'أكل', 'مستلزمات', 'دروس', 'أخرى']);
+  const SAVE_DELAY_MS = 700;
+  const MAX_AMOUNT = 1_000_000_000_000;
+
+  const DEFAULT_SUBJECTS = () => [
+    { id: 'sub_1', name: 'الفيزياء', estimatedFee: 0, sessionsAttended: 0 },
+    { id: 'sub_2', name: 'الكيمياء', estimatedFee: 0, sessionsAttended: 0 },
+    { id: 'sub_3', name: 'عربي', estimatedFee: 0, sessionsAttended: 0 },
+    { id: 'sub_4', name: 'أحياء', estimatedFee: 0, sessionsAttended: 0 },
+    { id: 'sub_5', name: 'إنجليزي', estimatedFee: 0, sessionsAttended: 0 }
+  ];
+
   const DEFAULT_STATE = () => ({
-    budget: 0, currency: 'ج.م', expenses: [],
-    subjects: [
-      { id: crypto.randomUUID(), name: 'الفيزياء', estimatedFee: 0, sessionsAttended: 0 },
-      { id: crypto.randomUUID(), name: 'الكيمياء', estimatedFee: 0, sessionsAttended: 0 },
-      { id: crypto.randomUUID(), name: 'عربي', estimatedFee: 0, sessionsAttended: 0 },
-      { id: crypto.randomUUID(), name: 'أحياء', estimatedFee: 0, sessionsAttended: 0 },
-      { id: crypto.randomUUID(), name: 'إنجليزي', estimatedFee: 0, sessionsAttended: 0 }
-    ],
-    subBudgets: Object.fromEntries(CATEGORIES.map((c) => [c, 0])),
-    lessonPayments: [], notes: [], notificationSettings: { emailEnabled: false }
+    budget: 0,
+    currency: 'ج.م',
+    expenses: [],
+    subjects: DEFAULT_SUBJECTS(),
+    subBudgets: Object.fromEntries(CATEGORIES.map((category) => [category, 0])),
+    lessonPayments: [],
+    notes: [],
+    notificationSettings: { emailEnabled: false }
   });
 
-  let supabaseClient;
-  let currentUser;
+  let supabaseClient = null;
+  let authSubscription = null;
+  let currentUser = null;
   let appState = DEFAULT_STATE();
-  let saveTimer;
-  let saveQueue = Promise.resolve();
-  let reportRows = [];
-  let categoryChartInstance;
-  let cumulativeChartInstance;
-  let onConfirmAction = null;
 
-  const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const money = (value) => Number(value || 0).toLocaleString('ar-EG', { maximumFractionDigits: 2 });
-  const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
-  const uid = () => crypto.randomUUID();
-  const setMessage = (id, text, error = false) => { const el = $(id); if (el) { el.textContent = text; el.className = `text-xs min-h-5 mb-2 ${error ? 'text-rose-600' : 'text-emerald-700'}`; } };
-  const setSync = (text, error = false) => { const el = $('syncStatus'); if (el) { el.textContent = text; el.className = error ? 'text-rose-200' : 'text-emerald-100'; } };
-  const totalExpenses = () => appState.expenses.reduce((s, x) => s + Number(x.amount || 0), 0);
-  const totalLessons = () => appState.lessonPayments.reduce((s, x) => s + Number(x.amount || 0), 0);
-  const localDate = (date) => date ? new Date(`${date}T00:00:00`) : null;
+  let saveTimer = null;
+  let saveQueue = Promise.resolve();
+  let sessionVersion = 0;
+  let pendingActivation = null;
+  let loadedUserId = null;
+  let sessionReady = false;
+  let stateRevision = 0;
+  let savedRevision = 0;
+  let initializationPromise = null;
+  let isSigningOut = false;
+
+  // ---------- General helpers ----------
+
+  function isPlainObject(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  }
+
+  function safeNumber(value, fallback = 0) {
+    const number = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(MAX_AMOUNT, Math.max(0, number));
+  }
+
+  function cloneJson(value) {
+    // Supabase JSONB data is JSON-compatible. JSON cloning also prevents callers
+    // from mutating the internal application state through returned references.
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function uid() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+    } catch (_) {
+      // Fall through to the compatibility implementation.
+    }
+    return `id_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 11)}`;
+  }
+
+  function today() {
+    const date = new Date();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  function money(value) {
+    const amount = Number.isFinite(Number(value)) ? Number(value) : 0;
+    return amount.toLocaleString('ar-EG', { maximumFractionDigits: 2 });
+  }
+
+  function getErrorMessage(error, fallback = 'حدث خطأ غير متوقع.') {
+    if (error && typeof error.message === 'string' && error.message.trim()) {
+      return error.message.trim();
+    }
+    return fallback;
+  }
+
+  function setMessage(id, message, isError = false) {
+    const element = $(id);
+    if (!element) return;
+    element.textContent = String(message ?? '');
+    element.className = `text-xs min-h-5 mb-2 ${isError ? 'text-rose-600 font-bold' : 'text-emerald-700'}`;
+    element.setAttribute('role', 'status');
+    element.setAttribute('aria-live', 'polite');
+  }
+
+  function setSyncStatus(message, isError = false) {
+    const element = $('syncStatus');
+    if (!element) return;
+    element.textContent = String(message ?? '');
+    element.className = isError ? 'text-rose-200 text-xs' : 'text-emerald-100 text-xs';
+    element.setAttribute('role', 'status');
+    element.setAttribute('aria-live', 'polite');
+  }
+
+  function setButtonBusy(id, busy, busyText) {
+    const button = $(id);
+    if (!button) return;
+
+    if (busy) {
+      if (!button.dataset.originalText) {
+        button.dataset.originalText = button.textContent || '';
+      }
+      button.disabled = true;
+      if (busyText) button.textContent = busyText;
+    } else {
+      button.disabled = false;
+      if (button.dataset.originalText !== undefined) {
+        button.textContent = button.dataset.originalText;
+        delete button.dataset.originalText;
+      }
+    }
+  }
+
+  function showAuthGate() {
+    const gate = $('authGate');
+    const shell = $('appShell');
+    if (shell) {
+      shell.classList.add('hidden');
+      shell.classList.remove('flex');
+    }
+    if (gate) gate.classList.remove('hidden');
+  }
+
+  function showAppShell() {
+    const gate = $('authGate');
+    const shell = $('appShell');
+    if (gate) gate.classList.add('hidden');
+    if (shell) {
+      shell.classList.remove('hidden');
+      shell.classList.add('flex');
+    }
+  }
+
+  // ---------- State validation / normalization ----------
+
+  function normalizeRecords(value) {
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter(isPlainObject)
+      .map((record) => {
+        const normalized = { ...record };
+        if (normalized.id === undefined || normalized.id === null || String(normalized.id).trim() === '') {
+          normalized.id = uid();
+        } else {
+          normalized.id = String(normalized.id);
+        }
+        if (Object.prototype.hasOwnProperty.call(normalized, 'amount')) {
+          normalized.amount = safeNumber(normalized.amount);
+        }
+        return normalized;
+      });
+  }
+
+  function normalizeSubjects(value, fallback) {
+    if (!Array.isArray(value)) return fallback;
+    return value
+      .filter(isPlainObject)
+      .map((subject) => ({
+        ...subject,
+        id: subject.id ? String(subject.id) : uid(),
+        name: typeof subject.name === 'string' ? subject.name.trim().slice(0, 120) : 'مادة بدون اسم',
+        estimatedFee: safeNumber(subject.estimatedFee),
+        sessionsAttended: Math.floor(safeNumber(subject.sessionsAttended))
+      }));
+  }
 
   function normalizeState(input) {
     const base = DEFAULT_STATE();
-    if (!input || typeof input !== 'object' || Array.isArray(input)) return base;
-    const merged = { ...base, ...input };
-    merged.budget = Math.max(0, Number(merged.budget) || 0);
-    merged.expenses = Array.isArray(merged.expenses) ? merged.expenses : [];
-    merged.subjects = Array.isArray(merged.subjects) ? merged.subjects : base.subjects;
-    merged.lessonPayments = Array.isArray(merged.lessonPayments) ? merged.lessonPayments : [];
-    merged.notes = Array.isArray(merged.notes) ? merged.notes : [];
-    merged.subBudgets = { ...base.subBudgets, ...(merged.subBudgets || {}) };
-    merged.notificationSettings = { ...base.notificationSettings, ...(merged.notificationSettings || {}) };
-    merged.currency = 'ج.م';
-    return merged;
+    if (!isPlainObject(input)) return base;
+
+    const inputBudgets = isPlainObject(input.subBudgets) ? input.subBudgets : {};
+    const inputNotifications = isPlainObject(input.notificationSettings)
+      ? input.notificationSettings
+      : {};
+
+    return {
+      budget: safeNumber(input.budget),
+      currency: 'ج.م',
+      expenses: normalizeRecords(input.expenses),
+      subjects: normalizeSubjects(input.subjects, base.subjects),
+      subBudgets: Object.fromEntries(
+        CATEGORIES.map((category) => [category, safeNumber(inputBudgets[category])])
+      ),
+      lessonPayments: normalizeRecords(input.lessonPayments),
+      notes: Array.isArray(input.notes) ? input.notes : [],
+      notificationSettings: {
+        emailEnabled: inputNotifications.emailEnabled === true
+      }
+    };
   }
 
-  async function initialize() {
-    try {
-      if (!window.APP_CONFIG?.supabaseUrl || !window.APP_CONFIG?.supabaseAnonKey || !window.supabase?.createClient) {
-        throw new Error('إعدادات Supabase غير مكتملة. راجع ملف README وإعدادات Vercel.');
-      }
-      supabaseClient = window.supabase.createClient(window.APP_CONFIG.supabaseUrl, window.APP_CONFIG.supabaseAnonKey, {
-        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
-      });
-      $('signInButton').addEventListener('click', () => authenticate(false));
-      $('signUpButton').addEventListener('click', () => authenticate(true));
-      $('forgotPasswordButton')?.addEventListener('click', sendPasswordReset);
-      $('signOutButton').addEventListener('click', signOut);
-      $('adminButton').addEventListener('click', openAdminPanel);
-      $('closeAdminButton').addEventListener('click', () => $('adminModal').classList.add('hidden'));
-      $('emailAlertToggle').addEventListener('change', changeEmailPreference);
-      $('enablePushButton').addEventListener('click', enablePushNotifications);
-      $('disablePushButton').addEventListener('click', disablePushNotifications);
-      $('confirmYesBtn').addEventListener('click', async () => { closeModal('confirmModal'); if (onConfirmAction) await onConfirmAction(); onConfirmAction = null; });
-      const { data: { session } } = await supabaseClient.auth.getSession();
-      if (session?.user) await activateSession(session.user);
-      supabaseClient.auth.onAuthStateChange((_event, sessionNow) => {
-        if (!sessionNow?.user) showAuth();
-      });
-    } catch (error) {
-      setMessage('authMessage', error.message || 'تعذر تهيئة التطبيق.', true);
+  function requireReadySession() {
+    if (!supabaseClient || !currentUser || !sessionReady || loadedUserId !== currentUser.id) {
+      throw new Error('بيانات الحساب لم تُحمّل بعد. تحقق من الاتصال ثم أعد المحاولة.');
     }
   }
 
-  async function authenticate(createAccount) {
-    const email = $('authEmail').value.trim();
-    const password = $('authPassword').value;
-    if (!email || password.length < 8) return setMessage('authMessage', 'أدخل بريدًا صحيحًا وكلمة مرور من 8 أحرف على الأقل.', true);
-    setMessage('authMessage', 'جارٍ الاتصال…');
-    const result = createAccount
-      ? await supabaseClient.auth.signUp({ email, password })
-      : await supabaseClient.auth.signInWithPassword({ email, password });
-    if (result.error) return setMessage('authMessage', result.error.message, true);
-    if (!result.data.session) return setMessage('authMessage', 'تم إنشاء الحساب. افحص بريدك لتأكيده، ثم سجّل الدخول.');
-    await activateSession(result.data.user);
+  // ---------- Dashboard ----------
+
+  function sumAmounts(records) {
+    if (!Array.isArray(records)) return 0;
+    return records.reduce((sum, record) => {
+      const amount = safeNumber(record && record.amount);
+      return Math.min(Number.MAX_SAFE_INTEGER, sum + amount);
+    }, 0);
+  }
+
+  function updateDashboardUI() {
+    const expensesTotal = sumAmounts(appState.expenses);
+    const lessonPaymentsTotal = sumAmounts(appState.lessonPayments);
+    const spent = expensesTotal + lessonPaymentsTotal;
+
+    const budgetDisplay = $('totalBudgetDisplay');
+    const spentDisplay = $('totalSpentDisplay');
+    const remainingDisplay = $('remainingDisplay');
+
+    if (budgetDisplay) budgetDisplay.textContent = money(appState.budget);
+    if (spentDisplay) spentDisplay.textContent = money(spent);
+    if (remainingDisplay) remainingDisplay.textContent = money(appState.budget - spent);
+  }
+
+  // ---------- Cloud persistence ----------
+
+  function clearSaveTimer() {
+    if (saveTimer !== null) {
+      window.clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+  }
+
+  function scheduleSave() {
+    if (!currentUser || !sessionReady) return;
+    clearSaveTimer();
+    setSyncStatus('توجد تغييرات غير محفوظة...');
+    saveTimer = window.setTimeout(() => {
+      saveTimer = null;
+      persistNow().catch((error) => {
+        console.error('Automatic save failed:', error);
+        // persistNow already updates the visible sync status.
+      });
+    }, SAVE_DELAY_MS);
+  }
+
+  function markDirty() {
+    requireReadySession();
+    stateRevision += 1;
+    scheduleSave();
+  }
+
+  async function persistNow(options = {}) {
+    const force = options.force === true;
+    if (!currentUser || !supabaseClient) {
+      throw new Error('لا يوجد مستخدم مسجل الدخول لحفظ البيانات.');
+    }
+    if (!sessionReady || loadedUserId !== currentUser.id) {
+      throw new Error('لا يمكن الحفظ قبل اكتمال تحميل بيانات الحساب.');
+    }
+
+    clearSaveTimer();
+    if (!force && savedRevision >= stateRevision) {
+      return { ok: true, skipped: true };
+    }
+
+    let snapshot;
+    try {
+      snapshot = cloneJson(appState);
+    } catch (error) {
+      setSyncStatus('تعذر تجهيز البيانات للحفظ', true);
+      throw new Error(`تعذر تحويل بيانات التطبيق إلى JSON: ${getErrorMessage(error)}`);
+    }
+
+    const userId = currentUser.id;
+    const capturedSessionVersion = sessionVersion;
+    const capturedRevision = stateRevision;
+    setSyncStatus('جارٍ الحفظ سحابياً...');
+
+    const writeTask = saveQueue.then(async () => {
+      // Prevent a delayed write from an old session from being applied after
+      // the user has signed out or another account has become active.
+      if (
+        capturedSessionVersion !== sessionVersion ||
+        !currentUser ||
+        currentUser.id !== userId ||
+        !sessionReady
+      ) {
+        throw new Error('تم إلغاء الحفظ لأن جلسة المستخدم تغيرت.');
+      }
+
+      const { error } = await supabaseClient
+        .from('app_data')
+        .upsert(
+          {
+            user_id: userId,
+            state: snapshot,
+            updated_at: new Date().toISOString()
+          },
+          { onConflict: 'user_id' }
+        );
+
+      if (error) throw error;
+
+      if (capturedSessionVersion === sessionVersion && currentUser?.id === userId) {
+        savedRevision = Math.max(savedRevision, capturedRevision);
+        if (savedRevision >= stateRevision) {
+          setSyncStatus('تم الحفظ سحابياً');
+        } else {
+          setSyncStatus('تم حفظ جزء من التغييرات، جارٍ حفظ الأحدث...');
+        }
+      }
+
+      return { ok: true, revision: capturedRevision };
+    });
+
+    // Keep the queue usable after a failed request, while returning the original
+    // rejection to the caller so that sign-out can be blocked on a failed save.
+    saveQueue = writeTask.catch(() => undefined);
+
+    try {
+      return await writeTask;
+    } catch (error) {
+      if (capturedSessionVersion === sessionVersion && currentUser?.id === userId) {
+        setSyncStatus('فشل الحفظ السحابي — بياناتك لم تُؤكَّد سحابياً', true);
+      }
+      throw error;
+    }
+  }
+
+  // ---------- Authentication ----------
+
+  function validateCredentials(email, password) {
+    const emailLooksValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    if (!emailLooksValid) {
+      throw new Error('يرجى كتابة بريد إلكتروني صالح.');
+    }
+    if (typeof password !== 'string' || password.length < 8) {
+      throw new Error('كلمة المرور يجب ألا تقل عن 8 أحرف.');
+    }
+  }
+
+  async function authenticate(isSignUp) {
+    if (!supabaseClient) {
+      setMessage('authMessage', 'خدمة تسجيل الدخول غير مهيأة. تحقق من إعدادات Supabase.', true);
+      return;
+    }
+
+    const email = $('authEmail')?.value?.trim() || '';
+    const password = $('authPassword')?.value || '';
+
+    try {
+      validateCredentials(email, password);
+    } catch (error) {
+      setMessage('authMessage', getErrorMessage(error), true);
+      return;
+    }
+
+    const buttonId = isSignUp ? 'signUpButton' : 'signInButton';
+    setButtonBusy(buttonId, true, 'جارٍ التنفيذ...');
+    setMessage('authMessage', 'جارٍ تنفيذ الطلب...');
+
+    try {
+      const response = isSignUp
+        ? await supabaseClient.auth.signUp({ email, password })
+        : await supabaseClient.auth.signInWithPassword({ email, password });
+
+      if (response.error) throw response.error;
+
+      const user = response.data?.user;
+      const session = response.data?.session;
+
+      if (isSignUp && !session) {
+        setMessage('authMessage', 'تم إنشاء الحساب. راجع بريدك الإلكتروني لتأكيد الحساب، ثم سجّل الدخول.');
+        return;
+      }
+
+      if (session?.user || user) {
+        await activateSession(session?.user || user);
+        if (sessionReady) setMessage('authMessage', 'تم تسجيل الدخول بنجاح.');
+      } else {
+        setMessage('authMessage', 'تم تنفيذ الطلب، لكن لم تُرجع الخدمة جلسة مستخدم.');
+      }
+    } catch (error) {
+      console.error('Authentication error:', error);
+      setMessage('authMessage', getErrorMessage(error, 'تعذر إتمام عملية تسجيل الدخول.'), true);
+    } finally {
+      setButtonBusy(buttonId, false);
+    }
   }
 
   async function sendPasswordReset() {
-    const email = $('authEmail').value.trim();
-    if (!email) return setMessage('authMessage', 'اكتب بريدك الإلكتروني أولًا ثم اضغط «نسيت كلمة المرور؟».', true);
-    setMessage('authMessage', 'جارٍ إرسال الرابط…');
-    const { error } = await supabaseClient.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/reset-password.html`
-    });
-    if (error) return setMessage('authMessage', error.message, true);
-    setMessage('authMessage', 'إذا كان البريد مسجلًا لدينا، فقد أرسلنا إليه رابط إعادة تعيين كلمة المرور. افحص بريدك.');
+    if (!supabaseClient) {
+      setMessage('authMessage', 'خدمة تسجيل الدخول غير مهيأة.', true);
+      return;
+    }
+
+    const email = $('authEmail')?.value?.trim() || '';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setMessage('authMessage', 'اكتب بريدًا إلكترونيًا صالحًا في الحقل بالأعلى أولاً.', true);
+      return;
+    }
+
+    setButtonBusy('forgotPasswordButton', true, 'جارٍ الإرسال...');
+    setMessage('authMessage', 'جارٍ إرسال رابط استعادة كلمة المرور...');
+
+    try {
+      const redirectTo =
+        window.APP_CONFIG?.passwordResetRedirectTo ||
+        `${window.location.origin}/reset-password.html`;
+
+      const { error } = await supabaseClient.auth.resetPasswordForEmail(email, { redirectTo });
+      if (error) throw error;
+
+      // Keep the message generic so the UI does not disclose whether an email
+      // address is registered in the system.
+      setMessage('authMessage', 'إذا كان البريد مسجلاً، فستصلك تعليمات استعادة كلمة المرور.');
+    } catch (error) {
+      console.error('Password reset request failed:', error);
+      setMessage('authMessage', getErrorMessage(error, 'تعذر إرسال رابط الاستعادة.'), true);
+    } finally {
+      setButtonBusy('forgotPasswordButton', false);
+    }
+  }
+
+  async function updatePassword(newPassword) {
+    if (!supabaseClient || !currentUser) {
+      throw new Error('يجب تسجيل الدخول أولاً.');
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 8) {
+      throw new Error('كلمة المرور الجديدة يجب ألا تقل عن 8 أحرف.');
+    }
+
+    const { data, error } = await supabaseClient.auth.updateUser({ password: newPassword });
+    if (error) throw error;
+    return data?.user || null;
+  }
+
+  function resetLocalSession() {
+    sessionVersion += 1;
+    pendingActivation = null;
+    currentUser = null;
+    loadedUserId = null;
+    sessionReady = false;
+    appState = DEFAULT_STATE();
+    stateRevision = 0;
+    savedRevision = 0;
+    clearSaveTimer();
+    updateDashboardUI();
+    showAuthGate();
   }
 
   async function activateSession(user) {
-    currentUser = user;
-    $('authGate').classList.add('hidden');
-    $('appShell').classList.remove('hidden');
-    $('appShell').classList.add('flex');
-    setSync('جارٍ تحميل البيانات…');
-    try {
-      const { data, error } = await supabaseClient.from('app_data').select('state').eq('user_id', user.id).maybeSingle();
-      if (error) throw error;
-      if (data?.state) appState = normalizeState(data.state);
-      else {
-        appState = DEFAULT_STATE();
-        await persistNow();
-      }
-      updateCurrencySymbols();
-      renderAll();
-      $('emailAlertToggle').checked = appState.notificationSettings.emailEnabled === true;
-      await checkAdminButton();
-      setSync('متزامن سحابيًا');
-      void dispatchNotifications();
-    } catch (error) {
-      setSync('تعذر تحميل البيانات', true);
-      alert(`تعذر تحميل بيانات حسابك من قاعدة البيانات: ${error.message}`);
-    }
-  }
+    if (!user || !user.id) return;
 
-  function showAuth() {
-    currentUser = null;
-    $('appShell').classList.add('hidden');
-    $('appShell').classList.remove('flex');
-    $('authGate').classList.remove('hidden');
-  }
-  async function signOut() { clearTimeout(saveTimer); await persistNow(); await saveQueue; await supabaseClient.auth.signOut(); appState = DEFAULT_STATE(); showAuth(); }
-
-  function persistNow() {
-    if (!currentUser) return Promise.resolve();
-    const snapshot = JSON.parse(JSON.stringify(appState));
-    const userId = currentUser.id;
-    setSync('جارٍ الحفظ…');
-    saveQueue = saveQueue.then(async () => {
-      const { error } = await supabaseClient.from('app_data').upsert({ user_id: userId, state: snapshot, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
-      if (error) throw error;
-      setSync('تم الحفظ سحابيًا');
-      void dispatchNotifications();
-    }).catch((error) => {
-      setSync('فشل الحفظ — صدّر نسخة احتياطية', true);
-      console.error('Cloud save failed', error);
-    });
-    return saveQueue;
-  }
-  function saveState() {
-    updateDashboard();
-    updateNotifications();
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => { persistNow(); }, 350);
-  }
-  function renderAll() {
-    renderExpenses(); renderSubjects(); renderLessonPayments(); renderSubBudgets(); renderNotes();
-    updateDashboard(); updateNotifications(); updateCurrencySymbols();
-    generateReport();
-  }
-  function updateCurrencySymbols() { document.querySelectorAll('.currencySymbol').forEach((e) => e.textContent = 'ج.م'); }
-  function updateDashboard() {
-    const spent = totalExpenses() + totalLessons();
-    if ($('totalBudgetDisplay')) $('totalBudgetDisplay').textContent = money(appState.budget);
-    if ($('totalSpentDisplay')) $('totalSpentDisplay').textContent = money(spent);
-    if ($('lessonsSpentDisplay')) $('lessonsSpentDisplay').textContent = money(totalLessons());
-    if ($('remainingDisplay')) $('remainingDisplay').textContent = money(appState.budget - spent);
-    const days = Math.max(1, new Date().getDate());
-    if ($('dailyAvgDisplay')) $('dailyAvgDisplay').textContent = money(totalExpenses() / days);
-    const leftDays = Math.max(1, new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate() - new Date().getDate() + 1);
-    if ($('dailyAllowedDisplay')) $('dailyAllowedDisplay').textContent = money(Math.max(0, appState.budget - spent) / leftDays);
-  }
-
-  function renderExpenses() {
-    const body = $('expensesTableBody'); if (!body) return;
-    const category = $('filterCategory')?.value || 'ALL';
-    const query = ($('searchExpenses')?.value || '').trim().toLowerCase();
-    const rows = appState.expenses.filter((x) => (category === 'ALL' || x.category === category) && `${x.note || ''} ${x.category || ''}`.toLowerCase().includes(query)).sort((a,b) => (b.date || '').localeCompare(a.date || ''));
-    body.innerHTML = rows.map((x) => `<tr class="border-b border-slate-100"><td class="p-3">${escapeHtml(x.date)}</td><td class="p-3">${escapeHtml(x.category)}</td><td class="p-3 font-bold">${money(x.amount)} ج.م</td><td class="p-3">${escapeHtml(x.note || '—')}</td><td class="p-3 text-center no-print"><button class="text-indigo-600 px-1" onclick="editExpense('${escapeHtml(x.id)}')">تعديل</button><button class="text-rose-600 px-1" onclick="deleteExpense('${escapeHtml(x.id)}')">حذف</button></td></tr>`).join('');
-    if ($('noExpensesMessage')) $('noExpensesMessage').classList.toggle('hidden', rows.length !== 0);
-  }
-  function renderSubjects() {
-    const wrap = $('subjectsContainer'); if (!wrap) return;
-    wrap.innerHTML = appState.subjects.map((s) => `<article class="bg-white border border-slate-200 rounded-2xl p-4"><div class="flex justify-between gap-2"><div><h3 class="font-black">${escapeHtml(s.name)}</h3><p class="text-xs text-slate-500 mt-1">الاشتراك التقديري: ${money(s.estimatedFee)} ج.م</p><p class="text-xs text-slate-500">الحصص: ${Number(s.sessionsAttended || 0)}</p></div><div class="flex flex-col gap-1"><button class="text-indigo-600 text-xs" onclick="editSubject('${escapeHtml(s.id)}')">تعديل</button><button class="text-rose-600 text-xs" onclick="deleteSubject('${escapeHtml(s.id)}')">حذف</button></div></div><button class="mt-3 text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg" onclick="openSessionEditor('${escapeHtml(s.id)}')">تعديل عدد الحصص</button></article>`).join('');
-    const select = $('lessonSubjectSelect'); if (select) select.innerHTML = appState.subjects.length ? appState.subjects.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)}</option>`).join('') : '<option value="">أضف مادة أولًا</option>';
-  }
-  function renderLessonPayments() {
-    const body = $('lessonPaymentsTableBody'); if (!body) return;
-    body.innerHTML = appState.lessonPayments.slice().sort((a,b) => (b.date||'').localeCompare(a.date||'')).map((p) => {
-      const subject = appState.subjects.find((s) => s.id === p.subjectId)?.name || p.subjectName || 'مادة محذوفة';
-      return `<tr class="border-b border-slate-100"><td class="p-3">${escapeHtml(p.date)}</td><td class="p-3">${escapeHtml(subject)}</td><td class="p-3">${escapeHtml(p.month)}</td><td class="p-3 font-bold">${money(p.amount)} ج.م</td><td class="p-3">${escapeHtml(p.teacher || '—')}</td><td class="p-3 text-center no-print"><button class="text-indigo-600" onclick="editLessonPayment('${escapeHtml(p.id)}')">تعديل</button> <button class="text-rose-600" onclick="deleteLessonPayment('${escapeHtml(p.id)}')">حذف</button></td></tr>`;
-    }).join('');
-  }
-  function renderSubBudgets() {
-    const wrap = $('subBudgetsContainer'); if (!wrap) return;
-    wrap.innerHTML = CATEGORIES.map((c) => {
-      const spent = appState.expenses.filter((x) => x.category === c).reduce((s,x) => s + Number(x.amount || 0),0);
-      const limit = Number(appState.subBudgets[c] || 0);
-      const pct = limit ? Math.min(100, Math.round(spent / limit * 100)) : 0;
-      return `<article class="bg-slate-50 border border-slate-200 rounded-2xl p-4"><div class="flex justify-between items-center"><strong>${escapeHtml(c)}</strong><button class="text-xs text-teal-700 font-bold" onclick="openLimitModal('${escapeHtml(c)}')">تعديل الحد</button></div><p class="text-xs text-slate-500 mt-2">الإنفاق: ${money(spent)}${limit ? ` / ${money(limit)} ج.م` : ' ج.م'}</p><div class="h-2 bg-slate-200 rounded-full mt-2 overflow-hidden"><div class="h-full bg-teal-500" style="width:${pct}%"></div></div></article>`;
-    }).join('');
-  }
-  function renderNotes() {
-    const wrap = $('notesGrid'); if (!wrap) return;
-    wrap.innerHTML = appState.notes.length ? appState.notes.map((n) => `<article class="bg-amber-50 border border-amber-100 rounded-2xl p-4"><div class="flex justify-between"><h3 class="font-bold">${escapeHtml(n.title)}</h3><button class="text-rose-600 text-xs" onclick="deleteNote('${escapeHtml(n.id)}')">حذف</button></div><p class="text-sm text-slate-600 mt-2 whitespace-pre-wrap">${escapeHtml(n.content || '')}</p>${n.date ? `<p class="text-xs text-amber-800 mt-3">تذكير: ${escapeHtml(n.date)}</p>` : ''}</article>`).join('') : '<p class="text-sm text-slate-400">لا توجد مذكرات حتى الآن.</p>';
-  }
-
-  function updateNotifications() {
-    const list = [];
-    const spent = totalExpenses() + totalLessons();
-    if (appState.budget > 0 && spent > appState.budget) list.push({ text: `تم تجاوز الميزانية بمقدار ${money(spent - appState.budget)} ج.م.`, type: 'rose' });
-    else if (appState.budget > 0 && spent >= appState.budget * 0.8) list.push({ text: `استهلكت ${Math.round(spent / appState.budget * 100)}٪ من الميزانية المحددة.`, type: 'amber' });
-    for (const category of CATEGORIES) {
-      const limit = Number(appState.subBudgets[category] || 0);
-      const amount = appState.expenses.filter((x) => x.category === category).reduce((s,x) => s + Number(x.amount || 0),0);
-      if (limit > 0 && amount >= limit) list.push({ text: `تم بلوغ حد تصنيف «${category}» أو تجاوزه (${money(amount)} من ${money(limit)} ج.م).`, type: 'rose' });
-      else if (limit > 0 && amount >= limit * 0.8) list.push({ text: `اقترب الإنفاق في «${category}» من الحد (${money(amount)} من ${money(limit)} ج.م).`, type: 'amber' });
-    }
-    for (const note of appState.notes) if (note.date && note.date <= today()) list.push({ text: `تذكير ${note.date < today() ? 'متأخر' : 'اليوم'}: ${note.title}`, type: 'indigo' });
-    const badge = $('notifBadge'); if (badge) { badge.textContent = String(list.length); badge.classList.toggle('hidden', list.length === 0); }
-    const container = $('notificationsList'); if (container) container.innerHTML = list.length ? list.map((n) => `<div class="p-3 rounded-xl border ${n.type === 'rose' ? 'bg-rose-50 border-rose-100 text-rose-800' : n.type === 'amber' ? 'bg-amber-50 border-amber-100 text-amber-800' : 'bg-indigo-50 border-indigo-100 text-indigo-800'} text-sm">${escapeHtml(n.text)}</div>`).join('') : '<p class="text-sm text-slate-500 p-3">لا توجد تنبيهات حاليًا.</p>';
-  }
-
-  function renderReport(data = null) {
-    const start = $('reportStartDate')?.value || '';
-    const end = $('reportEndDate')?.value || '';
-    const records = [];
-    appState.expenses.forEach((x) => records.push({ date: x.date, type: 'مصروف', category: x.category, details: x.note || '', amount: Number(x.amount || 0) }));
-    appState.lessonPayments.forEach((x) => records.push({ date: x.date, type: 'درس', category: appState.subjects.find((s) => s.id === x.subjectId)?.name || 'دروس', details: `${x.month || ''} ${x.teacher || ''}`.trim(), amount: Number(x.amount || 0), lesson: true }));
-    reportRows = records.filter((x) => (!start || x.date >= start) && (!end || x.date <= end)).sort((a,b) => (a.date || '').localeCompare(b.date || ''));
-    const spent = reportRows.reduce((s,x) => s + x.amount,0);
-    const lesson = reportRows.filter((x) => x.lesson).reduce((s,x) => s + x.amount,0);
-    const transitFood = reportRows.filter((x) => ['مواصلات','أكل'].includes(x.category)).reduce((s,x) => s + x.amount,0);
-    $('reportTotalSpent').textContent = money(spent); $('reportLessonsSpent').textContent = money(lesson); $('reportTransitFoodSpent').textContent = money(transitFood); $('reportCount').textContent = String(reportRows.length);
-    $('reportTableBody').innerHTML = reportRows.map((x) => `<tr><td class="p-2.5 border">${escapeHtml(x.date)}</td><td class="p-2.5 border">${escapeHtml(x.type)}</td><td class="p-2.5 border">${escapeHtml(x.category)}</td><td class="p-2.5 border">${escapeHtml(x.details)}</td><td class="p-2.5 border">${money(x.amount)} ج.م</td></tr>`).join('');
-    $('printCurrentDate').textContent = new Date().toLocaleDateString('ar-EG');
-    $('printPeriodText').textContent = start || end ? `من ${start || 'البداية'} إلى ${end || 'اليوم'}` : 'تقرير شامل لجميع الأوقات المسجلة';
-    drawCharts();
-  }
-  function drawCharts() {
-    if (!window.Chart) return;
-    const byCat = Object.fromEntries(CATEGORIES.map((c) => [c, reportRows.filter((x) => x.category === c).reduce((s,x) => s + x.amount,0)]));
-    if (categoryChartInstance) categoryChartInstance.destroy();
-    categoryChartInstance = new Chart($('categoryChart'), { type: 'doughnut', data: { labels: Object.keys(byCat), datasets: [{ data: Object.values(byCat), backgroundColor: ['#0f766e','#f59e0b','#6366f1','#e11d48','#64748b'] }] }, options: { responsive: true, maintainAspectRatio: false } });
-    if (cumulativeChartInstance) cumulativeChartInstance.destroy();
-    let sum = 0; const labels = reportRows.map((x) => x.date); const values = reportRows.map((x) => { sum += x.amount; return sum; });
-    cumulativeChartInstance = new Chart($('cumulativeChart'), { type: 'line', data: { labels, datasets: [{ label: 'إجمالي الإنفاق', data: values, borderColor: '#4f46e5', tension: .25 }] }, options: { responsive: true, maintainAspectRatio: false } });
-  }
-
-  function openModal(id) { const el = $(id); if (el) el.classList.remove('hidden'); }
-  function closeModal(id) { const el = $(id); if (el) el.classList.add('hidden'); }
-  function askConfirm(title, message, action) { $('confirmTitle').textContent = title; $('confirmMessage').textContent = message; onConfirmAction = action; openModal('confirmModal'); }
-  function switchTab(tab) {
-    document.querySelectorAll('.tab-content').forEach((el) => el.classList.add('hidden'));
-    document.querySelectorAll('.tab-btn').forEach((el) => { el.classList.remove('bg-emerald-600','text-white','shadow-sm'); el.classList.add('text-slate-600'); });
-    $(`content-${tab}`)?.classList.remove('hidden');
-    const btn = $(`tab-${tab}`); if (btn) { btn.classList.add('bg-emerald-600','text-white','shadow-sm'); btn.classList.remove('text-slate-600'); }
-    if (tab === 'reports') renderReport();
-  }
-  function openAddExpenseModal() { $('expenseEditId').value=''; $('expenseAmount').value=''; $('expenseNote').value=''; $('expenseDate').value=today(); $('expenseModalTitle').innerHTML='<i class="fa-solid fa-cart-plus text-emerald-600"></i> تسجيل مصروف جديد'; openModal('addExpenseModal'); }
-  function editExpense(id) { const x=appState.expenses.find((a)=>a.id===id); if(!x)return; $('expenseEditId').value=id; $('expenseAmount').value=x.amount; $('expenseCategory').value=x.category; $('expenseDate').value=x.date; $('expenseNote').value=x.note||''; openModal('addExpenseModal'); }
-  async function handleSaveExpense(e) { e.preventDefault(); const id=$('expenseEditId').value; const item={id:id||uid(),amount:Number($('expenseAmount').value),category:$('expenseCategory').value,date:$('expenseDate').value,note:$('expenseNote').value.trim()}; if(!item.amount||item.amount<=0||!item.date)return alert('تحقق من المبلغ والتاريخ.'); appState.expenses=id?appState.expenses.map((x)=>x.id===id?item:x):[item,...appState.expenses]; closeModal('addExpenseModal'); renderAll(); saveState(); }
-  function deleteExpense(id) { askConfirm('حذف المصروف','هل تريد حذف هذا المصروف؟',()=>{appState.expenses=appState.expenses.filter((x)=>x.id!==id);renderAll();saveState();}); }
-  function openSetBudgetModal(){ $('budgetAmountInput').value=appState.budget||'';openModal('setBudgetModal'); }
-  function handleSaveBudget(e){e.preventDefault();appState.budget=Number($('budgetAmountInput').value)||0;closeModal('setBudgetModal');renderAll();saveState();}
-  function openAddSubjectModal(id=''){ $('subjectEditId').value=id; const s=appState.subjects.find((x)=>x.id===id); $('subjectNameInput').value=s?.name||''; $('subjectFeeInput').value=s?.estimatedFee||''; openModal('addSubjectModal'); }
-  function handleAddSubject(e){e.preventDefault();const id=$('subjectEditId').value;const item={id:id||uid(),name:$('subjectNameInput').value.trim(),estimatedFee:Number($('subjectFeeInput').value)||0,sessionsAttended:appState.subjects.find((x)=>x.id===id)?.sessionsAttended||0};if(!item.name)return;appState.subjects=id?appState.subjects.map((x)=>x.id===id?item:x):[...appState.subjects,item];closeModal('addSubjectModal');renderAll();saveState();}
-  function editSubject(id){openAddSubjectModal(id);}
-  function deleteSubject(id){askConfirm('حذف المادة','حذف المادة لا يمسح الدفعات السابقة المرتبطة بها.',()=>{appState.subjects=appState.subjects.filter((x)=>x.id!==id);renderAll();saveState();});}
-  function openSessionEditor(id){const s=appState.subjects.find((x)=>x.id===id);if(!s)return;$('editSessionSubjectId').value=id;$('sessionCountInput').value=Number(s.sessionsAttended)||0;$('editSessionTitle').textContent=`تعديل حصص ${s.name}`;openModal('editSessionModal');}
-  function handleSaveSessionCount(e){e.preventDefault();const id=$('editSessionSubjectId').value;appState.subjects=appState.subjects.map((s)=>s.id===id?{...s,sessionsAttended:Math.max(0,Number($('sessionCountInput').value)||0)}:s);closeModal('editSessionModal');renderAll();saveState();}
-  function openAddLessonPaymentModal(){ $('lessonPaymentEditId').value='';$('lessonAmount').value='';$('lessonMonth').value='';$('lessonTeacher').value='';$('lessonDate').value=today();renderSubjects();openModal('addLessonPaymentModal'); }
-  function editLessonPayment(id){const p=appState.lessonPayments.find((x)=>x.id===id);if(!p)return;$('lessonPaymentEditId').value=id;$('lessonSubjectSelect').value=p.subjectId;$('lessonAmount').value=p.amount;$('lessonMonth').value=p.month;$('lessonTeacher').value=p.teacher||'';$('lessonDate').value=p.date;openModal('addLessonPaymentModal');}
-  function handleSaveLessonPayment(e){e.preventDefault();const id=$('lessonPaymentEditId').value;const item={id:id||uid(),subjectId:$('lessonSubjectSelect').value,amount:Number($('lessonAmount').value),month:$('lessonMonth').value.trim(),teacher:$('lessonTeacher').value.trim(),date:$('lessonDate').value};if(!item.subjectId||item.amount<=0||!item.date)return alert('تحقق من المادة والمبلغ والتاريخ.');appState.lessonPayments=id?appState.lessonPayments.map((x)=>x.id===id?item:x):[item,...appState.lessonPayments];closeModal('addLessonPaymentModal');renderAll();saveState();}
-  function deleteLessonPayment(id){askConfirm('حذف دفعة','هل تريد حذف هذه الدفعة؟',()=>{appState.lessonPayments=appState.lessonPayments.filter((x)=>x.id!==id);renderAll();saveState();});}
-  function openLimitModal(category){$('limitCategoryName').value=category;$('limitCategoryTitle').textContent=`تعيين حد ${category}`;$('limitAmountInput').value=appState.subBudgets[category]||'';openModal('setLimitModal');}
-  function handleSaveSubBudget(e){e.preventDefault();const c=$('limitCategoryName').value;appState.subBudgets[c]=Number($('limitAmountInput').value)||0;closeModal('setLimitModal');renderAll();saveState();}
-  function handleAddNote(e){e.preventDefault();appState.notes.unshift({id:uid(),title:$('noteTitle').value.trim(),content:$('noteContent').value.trim(),date:$('noteDate').value||''});e.target.reset();closeModal('addNoteModal');renderAll();saveState();}
-  function deleteNote(id){askConfirm('حذف المذكرة','هل تريد حذف هذه المذكرة؟',()=>{appState.notes=appState.notes.filter((x)=>x.id!==id);renderAll();saveState();});}
-  function generateReport(){renderReport();}
-  function resetReportDates(){ $('reportStartDate').value='';$('reportEndDate').value='';renderReport(); }
-  function triggerPrint(){window.print();}
-  function exportCSV(){const rows=[['التاريخ','النوع','التصنيف','التفاصيل','المبلغ'],...reportRows.map((x)=>[x.date,x.type,x.category,x.details,x.amount])];const csv='\ufeff'+rows.map((r)=>r.map((v)=>`"${String(v??'').replaceAll('"','""')}"`).join(',')).join('\r\n');download(new Blob([csv],{type:'text/csv;charset=utf-8'}),`budget-report-${today()}.csv`);}
-  function download(blob,name){const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
-  function exportJSONData(){download(new Blob([JSON.stringify(appState,null,2)],{type:'application/json'}),`budget-backup-${today()}.json`);}
-  async function importJSONData(event){const file=event.target.files?.[0];if(!file)return;try{const raw=JSON.parse(await file.text());appState=normalizeState(raw);renderAll();saveState();alert('تم استيراد النسخة. انتظر ظهور «تم الحفظ سحابيًا» قبل إغلاق الصفحة.');}catch(e){alert('تعذر استيراد الملف: صيغة JSON غير صحيحة.');}finally{event.target.value='';}}
-  function loadDemoSampleData(){askConfirm('تحميل عينة','ستُستبدل بيانات الحساب الحالية بعينة توضيحية. هل تتابع؟',()=>{appState=DEFAULT_STATE();appState.budget=5000;appState.expenses=[{id:uid(),date:today(),category:'مواصلات',amount:75,note:'عينة مواصلات'},{id:uid(),date:today(),category:'أكل',amount:120,note:'عينة طعام'}];renderAll();saveState();});}
-  function resetAllDataData(){askConfirm('تصفير البيانات','سيؤدي ذلك إلى حذف جميع بياناتك المحفوظة لهذا الحساب. هل تريد المتابعة؟',()=>{appState=DEFAULT_STATE();renderAll();saveState();});}
-
-  async function changeEmailPreference(event) {
-    const enabled = event.target.checked;
-    if (enabled && !window.APP_CONFIG?.emailConfigured) {
-      event.target.checked = false;
-      $('notificationSettingsMessage').textContent = 'إرسال البريد غير مهيأ بعد؛ أضف إعدادات Resend في Vercel أولًا.';
+    // Reuse an in-flight activation for the same account. This avoids duplicate
+    // loads when both the button handler and Supabase auth event fire.
+    if (currentUser?.id === user.id && sessionReady && loadedUserId === user.id) {
+      currentUser = user;
+      showAppShell();
       return;
     }
-    appState.notificationSettings.emailEnabled = enabled;
-    $('notificationSettingsMessage').textContent = enabled ? 'تم تفعيل البريد. ستُرسل تنبيهات عامة عند تحقق شرط جديد.' : 'تم إيقاف تنبيهات البريد.';
-    saveState();
-  }
+    if (pendingActivation?.userId === user.id) {
+      currentUser = user;
+      return pendingActivation.promise;
+    }
 
-  function base64UrlToBytes(value) {
-    const padded = value + '='.repeat((4 - value.length % 4) % 4);
-    const raw = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
-    return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
-  }
+    const thisSessionVersion = ++sessionVersion;
+    currentUser = user;
+    loadedUserId = null;
+    sessionReady = false;
+    appState = DEFAULT_STATE();
+    stateRevision = 0;
+    savedRevision = 0;
+    clearSaveTimer();
+    setSyncStatus('جارٍ تحميل بيانات حسابك...');
 
-  async function enablePushNotifications() {
-    const status = $('notificationSettingsMessage');
-    try {
-      if (!window.APP_CONFIG?.pushConfigured || !window.APP_CONFIG?.vapidPublicKey) throw new Error('إشعارات المتصفح غير مهيأة على Vercel بعد.');
-      if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) throw new Error('هذا المتصفح لا يدعم Web Push؛ استخدم Chrome أو Edge أو Firefox عبر HTTPS.');
-      const permission = await Notification.requestPermission();
-      if (permission !== 'granted') throw new Error('لم يتم منح إذن الإشعارات. يمكنك تفعيله من إعدادات المتصفح.');
-      const registration = await navigator.serviceWorker.register('/sw.js');
-      const ready = await navigator.serviceWorker.ready;
-      let subscription = await ready.pushManager.getSubscription();
-      if (!subscription) subscription = await ready.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(window.APP_CONFIG.vapidPublicKey) });
-      const json = subscription.toJSON();
-      const { error } = await supabaseClient.from('push_subscriptions').upsert({ user_id: currentUser.id, endpoint: subscription.endpoint, subscription: json }, { onConflict: 'endpoint' });
-      if (error) throw error;
-      status.textContent = 'تم تفعيل إشعارات المتصفح على هذا الجهاز.';
-      void dispatchNotifications();
-    } catch (error) { status.textContent = error.message || 'تعذر تفعيل الإشعارات.'; }
-  }
+    const activationPromise = (async () => {
+      try {
+        const { data, error } = await supabaseClient
+          .from('app_data')
+          .select('state')
+          .eq('user_id', user.id)
+          .maybeSingle();
 
-  async function disablePushNotifications() {
-    const status = $('notificationSettingsMessage');
-    try {
-      const registration = await navigator.serviceWorker.getRegistration('/');
-      const subscription = await registration?.pushManager.getSubscription();
-      if (subscription) {
-        const endpoint = subscription.endpoint;
-        await subscription.unsubscribe();
-        const { error } = await supabaseClient.from('push_subscriptions').delete().eq('user_id', currentUser.id).eq('endpoint', endpoint);
         if (error) throw error;
+        if (thisSessionVersion !== sessionVersion || currentUser?.id !== user.id) return;
+
+        if (data && data.state !== null && data.state !== undefined) {
+          appState = normalizeState(data.state);
+        } else {
+          appState = DEFAULT_STATE();
+        }
+
+        loadedUserId = user.id;
+        sessionReady = true;
+        stateRevision = 0;
+        savedRevision = 0;
+        updateDashboardUI();
+        showAppShell();
+
+        if (!data) {
+          // First login: create the initial row. Do not mark the app ready until
+          // the first save succeeds, so a missing/blocked row is not silently lost.
+          await persistNow({ force: true });
+        } else {
+          setSyncStatus('متزامن سحابياً');
+        }
+      } catch (error) {
+        console.error('Account data load/initial save failed:', error);
+        if (thisSessionVersion !== sessionVersion || currentUser?.id !== user.id) return;
+        sessionReady = false;
+        loadedUserId = null;
+        setSyncStatus('تعذر تحميل البيانات — لم يتم استبدال بياناتك', true);
+        showAuthGate();
+        setMessage(
+          'authMessage',
+          `تم التعرف على الحساب، لكن تعذر تحميل بياناته من السحابة. تحقق من الإنترنت وإعدادات قاعدة البيانات ثم أعد تحميل الصفحة. (${getErrorMessage(error)})`,
+          true
+        );
+        throw error;
+      } finally {
+        if (pendingActivation?.version === thisSessionVersion) {
+          pendingActivation = null;
+        }
       }
-      status.textContent = 'تم إيقاف إشعارات هذا الجهاز.';
-    } catch (error) { status.textContent = error.message || 'تعذر إيقاف الإشعارات.'; }
+    })();
+
+    pendingActivation = {
+      userId: user.id,
+      version: thisSessionVersion,
+      promise: activationPromise
+    };
+
+    return activationPromise;
   }
 
-  async function dispatchNotifications() {
-    if (!currentUser || document.visibilityState === 'prerender' || !window.APP_CONFIG?.notificationApiConfigured) return;
+  async function handleAuthStateChange(event, session) {
+    if (session?.user) {
+      try {
+        await activateSession(session.user);
+      } catch (_) {
+        // The activation handler already reports the error to the interface.
+      }
+      return;
+    }
+
+    if (event === 'SIGNED_OUT' || event === 'INITIAL_SESSION') {
+      resetLocalSession();
+      if (!isSigningOut) setMessage('authMessage', 'يرجى تسجيل الدخول للمتابعة.');
+    }
+  }
+
+  async function signOut() {
+    if (!supabaseClient) {
+      resetLocalSession();
+      return;
+    }
+    if (isSigningOut) return;
+
+    isSigningOut = true;
+    setButtonBusy('signOutButton', true, 'جارٍ تسجيل الخروج...');
+    clearSaveTimer();
+
     try {
-      const { data: { session } } = await supabaseClient.auth.getSession();
-      if (!session?.access_token) return;
-      const response = await fetch('/api/notify', { method: 'POST', headers: { Authorization: `Bearer ${session.access_token}`, 'Content-Type': 'application/json' }, body: '{}' });
-      if (!response.ok) console.warn('Notification dispatch is not ready:', await response.text());
-    } catch (error) { console.warn('Notification dispatch failed:', error); }
+      // Do not sign out if the latest local edits could not be saved.
+      if (currentUser && sessionReady && savedRevision < stateRevision) {
+        await persistNow({ force: true });
+      }
+
+      const { error } = await supabaseClient.auth.signOut();
+      if (error) throw error;
+
+      resetLocalSession();
+      setMessage('authMessage', 'تم تسجيل الخروج بنجاح.');
+    } catch (error) {
+      console.error('Sign-out failed:', error);
+      setSyncStatus('تعذر تسجيل الخروج بأمان أو حفظ آخر التعديلات', true);
+      // Keep the current session active so the user can retry saving.
+    } finally {
+      isSigningOut = false;
+      setButtonBusy('signOutButton', false);
+    }
   }
 
-  async function checkAdminButton() {
-    try {
-      const { data: { session } } = await supabaseClient.auth.getSession();
-      const response = await fetch('/api/admin-data?mode=status', { headers: { Authorization: `Bearer ${session.access_token}` } });
-      const result = await response.json();
-      $('adminButton').classList.toggle('hidden', !response.ok || !result.isAdmin);
-    } catch (_) { $('adminButton').classList.add('hidden'); }
+  // ---------- Public state API ----------
+
+  function updateState(updater, options = {}) {
+    requireReadySession();
+    if (typeof updater !== 'function') {
+      throw new TypeError('updateState يتطلب دالة تعدّل نسخة الحالة.');
+    }
+
+    const draft = cloneJson(appState);
+    const result = updater(draft);
+    if (result && typeof result.then === 'function') {
+      throw new TypeError('يجب أن تكون دالة updateState متزامنة وليست async.');
+    }
+
+    appState = normalizeState(result === undefined ? draft : result);
+    updateDashboardUI();
+    if (options.save !== false) markDirty();
+    return cloneJson(appState);
   }
 
-  async function openAdminPanel(){
-    $('adminModal').classList.remove('hidden'); $('adminModal').classList.add('flex'); $('adminMessage').textContent='جارٍ التحقق وتحميل السجلات…'; $('adminUsers').innerHTML='';
-    try {
-      const { data: { session } } = await supabaseClient.auth.getSession();
-      const response = await fetch('/api/admin-data', { headers: { Authorization: `Bearer ${session.access_token}` } });
-      const payload = await response.json(); if (!response.ok) throw new Error(payload.error || 'رفض الخادم الطلب.');
-      $('adminMessage').textContent=`عدد الحسابات: ${payload.users.length} — تم تسجيل عملية الاطلاع.`;
-      $('adminUsers').innerHTML=payload.users.map((u)=>`<article class="border border-slate-200 rounded-xl p-3"><div class="font-bold">${escapeHtml(u.email || 'بريد غير متاح')}</div><div class="text-xs text-slate-500 mt-1">معرّف: ${escapeHtml(u.user_id)} — آخر تحديث: ${escapeHtml(u.updated_at || 'لا توجد بيانات')}</div><details class="mt-2"><summary class="cursor-pointer text-sm text-indigo-700">عرض بيانات التطبيق</summary><pre class="text-xs whitespace-pre-wrap overflow-auto max-h-72 bg-slate-50 p-3 mt-2 rounded-lg">${escapeHtml(JSON.stringify(u.state || {},null,2))}</pre></details></article>`).join('') || '<p>لا توجد حسابات مسجلة.</p>';
-    } catch(error) { $('adminMessage').textContent=error.message; }
+  function replaceState(nextState, options = {}) {
+    requireReadySession();
+    appState = normalizeState(nextState);
+    updateDashboardUI();
+    if (options.save !== false) markDirty();
+    return cloneJson(appState);
   }
 
-  // Keep legacy inline handlers global for the supplied HTML.
-  Object.assign(window,{openModal,closeModal,switchTab,openAddExpenseModal,handleSaveExpense,editExpense,deleteExpense,openSetBudgetModal,handleSaveBudget,openAddSubjectModal,handleAddSubject,editSubject,deleteSubject,openSessionEditor,handleSaveSessionCount,openAddLessonPaymentModal,handleSaveLessonPayment,editLessonPayment,deleteLessonPayment,openLimitModal,handleSaveSubBudget,handleAddNote,deleteNote,renderExpenses,generateReport,resetReportDates,triggerPrint,exportCSV,exportJSONData,importJSONData,loadDemoSampleData,resetAllDataData});
-  initialize();
+  function setBudget(amount) {
+    const value = safeNumber(amount, NaN);
+    if (!Number.isFinite(value)) throw new Error('قيمة الميزانية غير صحيحة.');
+    return updateState((state) => { state.budget = value; });
+  }
+
+  function setSubBudget(category, amount) {
+    if (!CATEGORIES.includes(category)) throw new Error('فئة الميزانية غير معروفة.');
+    const value = safeNumber(amount, NaN);
+    if (!Number.isFinite(value)) throw new Error('قيمة الميزانية الفرعية غير صحيحة.');
+    return updateState((state) => { state.subBudgets[category] = value; });
+  }
+
+  function addExpense(expense) {
+    if (!isPlainObject(expense)) throw new TypeError('بيانات المصروف غير صحيحة.');
+    const amount = safeNumber(expense.amount, NaN);
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('قيمة المصروف يجب أن تكون أكبر من صفر.');
+
+    const record = {
+      ...expense,
+      id: expense.id ? String(expense.id) : uid(),
+      amount,
+      category: CATEGORIES.includes(expense.category) ? expense.category : 'أخرى',
+      date: typeof expense.date === 'string' && expense.date ? expense.date : today()
+    };
+    updateState((state) => { state.expenses.push(record); });
+    return cloneJson(record);
+  }
+
+  function updateRecord(collectionName, id, changes) {
+    const allowedCollections = ['expenses', 'lessonPayments', 'subjects'];
+    if (!allowedCollections.includes(collectionName)) throw new Error('قائمة البيانات غير مسموح بتعديلها.');
+    if (!isPlainObject(changes)) throw new TypeError('التعديلات غير صحيحة.');
+
+    const exists = appState[collectionName].some((record) => String(record.id) === String(id));
+    if (!exists) throw new Error('العنصر المطلوب غير موجود.');
+
+    updateState((state) => {
+      state[collectionName] = state[collectionName].map((record) => {
+        if (String(record.id) !== String(id)) return record;
+        const updated = { ...record, ...changes, id: record.id };
+        if (Object.prototype.hasOwnProperty.call(updated, 'amount')) {
+          const amount = safeNumber(updated.amount, NaN);
+          if (!Number.isFinite(amount)) throw new Error('القيمة المالية غير صحيحة.');
+          updated.amount = amount;
+        }
+        if (collectionName === 'subjects') {
+          updated.estimatedFee = safeNumber(updated.estimatedFee);
+          updated.sessionsAttended = Math.floor(safeNumber(updated.sessionsAttended));
+        }
+        return updated;
+      });
+    });
+    return true;
+  }
+
+  function deleteRecord(collectionName, id) {
+    const allowedCollections = ['expenses', 'lessonPayments', 'subjects'];
+    if (!allowedCollections.includes(collectionName)) throw new Error('قائمة البيانات غير مسموح بتعديلها.');
+    const exists = appState[collectionName].some((record) => String(record.id) === String(id));
+    if (!exists) return false;
+    updateState((state) => {
+      state[collectionName] = state[collectionName].filter((record) => String(record.id) !== String(id));
+    });
+    return true;
+  }
+
+  function addLessonPayment(payment) {
+    if (!isPlainObject(payment)) throw new TypeError('بيانات دفعة الدرس غير صحيحة.');
+    const amount = safeNumber(payment.amount, NaN);
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('قيمة الدفعة يجب أن تكون أكبر من صفر.');
+    const record = {
+      ...payment,
+      id: payment.id ? String(payment.id) : uid(),
+      amount,
+      date: typeof payment.date === 'string' && payment.date ? payment.date : today()
+    };
+    updateState((state) => { state.lessonPayments.push(record); });
+    return cloneJson(record);
+  }
+
+  // ---------- Initialization ----------
+
+  function bindClick(id, handler) {
+    const element = $(id);
+    if (!element) return;
+    // Avoid duplicate listeners if initializeApp is called more than once.
+    if (element.dataset.budgetBound === 'true') return;
+    element.dataset.budgetBound = 'true';
+    element.addEventListener('click', (event) => {
+      event.preventDefault();
+      Promise.resolve(handler()).catch((error) => {
+        console.error(`Handler failed (${id}):`, error);
+        if (id.startsWith('sign') || id === 'forgotPasswordButton') {
+          setMessage('authMessage', getErrorMessage(error), true);
+        }
+      });
+    });
+  }
+
+  async function initializeApp() {
+    if (initializationPromise) return initializationPromise;
+
+    initializationPromise = (async () => {
+      try {
+        const url = window.APP_CONFIG?.supabaseUrl || window.SUPABASE_URL || '';
+        const key = window.APP_CONFIG?.supabaseAnonKey || window.SUPABASE_ANON_KEY || '';
+
+        if (!url || !key) {
+          throw new Error('إعدادات Supabase غير مكتملة: يلزم رابط المشروع ومفتاح anon/publishable.');
+        }
+        if (!window.supabase || typeof window.supabase.createClient !== 'function') {
+          throw new Error('مكتبة Supabase غير محمّلة. تأكد من تحميل supabase-js v2 قبل هذا الملف.');
+        }
+        if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+          throw new Error('رابط Supabase غير صالح.');
+        }
+        if (/service_role|sb_secret_/i.test(key)) {
+          throw new Error('ممنوع استخدام service_role أو secret key داخل المتصفح. استخدم anon/publishable key فقط.');
+        }
+
+        supabaseClient = window.supabase.createClient(url, key, {
+          auth: {
+            persistSession: true,
+            autoRefreshToken: true,
+            detectSessionInUrl: true
+          }
+        });
+
+        bindClick('signInButton', () => authenticate(false));
+        bindClick('signUpButton', () => authenticate(true));
+        bindClick('signOutButton', signOut);
+        bindClick('forgotPasswordButton', sendPasswordReset);
+
+        // Keep the callback synchronous; defer async work out of Supabase's
+        // auth callback to avoid holding its internal auth lock.
+        const listenerResult = supabaseClient.auth.onAuthStateChange((event, session) => {
+          Promise.resolve().then(() => handleAuthStateChange(event, session));
+        });
+        authSubscription = listenerResult?.data?.subscription || null;
+
+        const { data, error } = await supabaseClient.auth.getSession();
+        if (error) throw error;
+
+        if (data?.session?.user) {
+          await activateSession(data.session.user);
+        } else {
+          showAuthGate();
+          setMessage('authMessage', 'أدخل بريدك الإلكتروني وكلمة المرور للمتابعة.');
+        }
+      } catch (error) {
+        console.error('Application initialization failed:', error);
+        setSyncStatus('تعذر تهيئة التطبيق', true);
+        setMessage('authMessage', getErrorMessage(error, 'فشل تهيئة التطبيق.'), true);
+        showAuthGate();
+      }
+    })();
+
+    return initializationPromise;
+  }
+
+  // Minimal public interface for the rest of the app's UI code.
+  // Always modify state through these methods; do not keep external references
+  // to the internal appState object.
+  window.BudgetApp = Object.freeze({
+    categories: CATEGORIES,
+    initialize: initializeApp,
+    getState: () => cloneJson(appState),
+    updateState,
+    replaceState,
+    setBudget,
+    setSubBudget,
+    addExpense,
+    updateExpense: (id, changes) => updateRecord('expenses', id, changes),
+    deleteExpense: (id) => deleteRecord('expenses', id),
+    addLessonPayment,
+    updateLessonPayment: (id, changes) => updateRecord('lessonPayments', id, changes),
+    deleteLessonPayment: (id) => deleteRecord('lessonPayments', id),
+    updateSubject: (id, changes) => updateRecord('subjects', id, changes),
+    deleteSubject: (id) => deleteRecord('subjects', id),
+    save: () => persistNow({ force: true }),
+    signOut,
+    updatePassword,
+    retryLoad: async () => {
+      if (!currentUser) throw new Error('لا توجد جلسة مستخدم لإعادة تحميلها.');
+      return activateSession(currentUser);
+    },
+    isReady: () => sessionReady,
+    getCurrentUser: () => currentUser ? { id: currentUser.id, email: currentUser.email || '' } : null
+  });
+
+  // Best-effort flush when the tab is backgrounded or navigated away from.
+  // Browsers may still stop async work during unload, so the debounce interval
+  // remains short and every normal save is completed during the active session.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && currentUser && sessionReady && savedRevision < stateRevision) {
+      clearSaveTimer();
+      persistNow().catch((error) => console.error('Background save failed:', error));
+    }
+  });
+
+  window.addEventListener('pagehide', () => {
+    if (currentUser && sessionReady && savedRevision < stateRevision) {
+      clearSaveTimer();
+      persistNow().catch((error) => console.error('Page-exit save failed:', error));
+    }
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initializeApp, { once: true });
+  } else {
+    initializeApp();
+  }
 })();
