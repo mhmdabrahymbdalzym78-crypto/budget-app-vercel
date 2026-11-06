@@ -61,6 +61,7 @@
       });
       $('signInButton').addEventListener('click', () => authenticate(false));
       $('signUpButton').addEventListener('click', () => authenticate(true));
+      $('forgotPasswordButton')?.addEventListener('click', sendPasswordReset);
       $('signOutButton').addEventListener('click', signOut);
       $('adminButton').addEventListener('click', openAdminPanel);
       $('closeAdminButton').addEventListener('click', () => $('adminModal').classList.add('hidden'));
@@ -89,6 +90,17 @@
     if (result.error) return setMessage('authMessage', result.error.message, true);
     if (!result.data.session) return setMessage('authMessage', 'تم إنشاء الحساب. افحص بريدك لتأكيده، ثم سجّل الدخول.');
     await activateSession(result.data.user);
+  }
+
+  async function sendPasswordReset() {
+    const email = $('authEmail').value.trim();
+    if (!email) return setMessage('authMessage', 'اكتب بريدك الإلكتروني أولًا ثم اضغط «نسيت كلمة المرور؟».', true);
+    setMessage('authMessage', 'جارٍ إرسال الرابط…');
+    const { error } = await supabaseClient.auth.resetPasswordForEmail(email, {
+      redirectTo: `${window.location.origin}/reset-password.html`
+    });
+    if (error) return setMessage('authMessage', error.message, true);
+    setMessage('authMessage', 'إذا كان البريد مسجلًا لدينا، فقد أرسلنا إليه رابط إعادة تعيين كلمة المرور. افحص بريدك.');
   }
 
   async function activateSession(user) {
